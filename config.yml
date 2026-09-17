@@ -1,0 +1,40 @@
+# python train.py -c config.yml
+# python train.py --data data/nb --lr 1e-3 --epochs 200
+
+# data
+data: data/nb
+train_npy: train.npy
+val_npy: val.npy
+
+# model
+hidden: 128
+layers: 3
+continuous_t: true
+lbd: 100.0                 # train γ ∈ (0, λ], sample SNR 0 → λ
+z_rescale: false
+clip_z: true
+clip_range: null          # e.g. [0, 50]
+normalize: null           # e.g. [mean, std] on x0
+
+# train
+epochs: 200
+batch_size: 256
+lr: 0.001
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.0
+t_eps: 1.0e-4             # t ~ Unif[t_eps, 1], γ = t * lbd
+seed: 0
+
+# io
+out_dir: experiments/nb
+device: cuda
+val_every: 10             # print val + write latest.pt / best.pt every N epochs (always at the end)
+
+# sample (not used in train)
+snr_min: 0.0
+snr_max: 100.0            # same as lbd
+sample_steps: 100         # constant gap h = (snr_max-snr_min)/steps
+n_sample: 50000
+sample_batch: 4096
+kernels: poisson,nb,repoisson

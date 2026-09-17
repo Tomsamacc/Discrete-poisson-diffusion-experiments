@@ -1,0 +1,34 @@
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# data and checkpoints
+data/**/*.npy
+*.pt
+*.pth
+*.ckpt
+
+# experiment outputs
+experiments/
+runs/
+
+# samples / plots / logs
+*.npy
+*.png
+*.pdf
+*.log
+
+# keep code-side json out of runs; generated dumps
+**/args.json
+**/sample_args.json
+**/metrics.txt
+
+# env / editor
+.env
+.DS_Store
+.idea/
+.vscode/
+*.swp

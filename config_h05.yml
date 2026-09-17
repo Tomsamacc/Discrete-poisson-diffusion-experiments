@@ -1,0 +1,40 @@
+# SNR 0→100, 200 steps, h=0.5
+# python train.py -c config_h05.yml --data data/nb --out_dir experiments/h05/nb
+
+# data
+data: data/nb
+train_npy: train.npy
+val_npy: val.npy
+
+# model
+hidden: 128
+layers: 3
+continuous_t: true
+lbd: 100.0
+z_rescale: false
+clip_z: true
+clip_range: null
+normalize: null
+
+# train
+epochs: 200
+batch_size: 256
+lr: 0.001
+beta1: 0.9
+beta2: 0.999
+weight_decay: 0.0
+t_eps: 1.0e-4
+seed: 0
+
+# io
+out_dir: experiments/h05/nb
+device: cuda
+val_every: 10
+
+# sample
+snr_min: 0.0
+snr_max: 100.0
+sample_steps: 200         # h = 100/200 = 0.5
+n_sample: 50000
+sample_batch: 4096
+kernels: poisson,nb,repoisson,twopois
