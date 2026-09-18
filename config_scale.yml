@@ -1,3 +1,4 @@
+# SNR 0→100, 100 steps, h=1, scale on
 # python train.py -c config_scale.yml --data data/nb --out_dir experiments/scale/nb
 
 # data
@@ -37,4 +38,4 @@ snr_max: 100.0
 sample_steps: 100
 n_sample: 50000
 sample_batch: 4096
-kernels: poisson,nb,repoisson
+kernels: poisson,nb,repoisson,twopois

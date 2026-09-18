@@ -56,16 +56,45 @@ def true_pmf(name, ks):
     ks = np.asarray(ks)
     if name == "nb":
         return stats.nbinom.pmf(ks, n=5, p=0.2)
+    if name == "pois20":
+        return stats.poisson.pmf(ks, 20)
     if name == "poismix_mod":
         return 0.5 * stats.poisson.pmf(ks, 5) + 0.5 * stats.poisson.pmf(ks, 50)
+    if name == "poissmix":
+        return 0.1 * stats.poisson.pmf(ks, 1) + 0.9 * stats.poisson.pmf(ks, 100)
+    if name == "poissmix3":
+        return (
+            (1.0 / 3.0) * stats.poisson.pmf(ks, 1)
+            + (1.0 / 3.0) * stats.poisson.pmf(ks, 50)
+            + (1.0 / 3.0) * stats.poisson.pmf(ks, 100)
+        )
+    if name == "zip":
+        p = 0.3 * stats.poisson.pmf(ks, 5.0)
+        return np.where(ks == 0, p + 0.7, p)
+    if name == "yule_simon":
+        return stats.yulesimon.pmf(ks, 2.0)
     raise ValueError(name)
 
 
 def true_cdf(name, k):
     if name == "nb":
         return float(stats.nbinom.cdf(k, n=5, p=0.2))
+    if name == "pois20":
+        return float(stats.poisson.cdf(k, 20))
     if name == "poismix_mod":
         return float(0.5 * stats.poisson.cdf(k, 5) + 0.5 * stats.poisson.cdf(k, 50))
+    if name == "poissmix":
+        return float(0.1 * stats.poisson.cdf(k, 1) + 0.9 * stats.poisson.cdf(k, 100))
+    if name == "poissmix3":
+        return float(
+            (1.0 / 3.0) * stats.poisson.cdf(k, 1)
+            + (1.0 / 3.0) * stats.poisson.cdf(k, 50)
+            + (1.0 / 3.0) * stats.poisson.cdf(k, 100)
+        )
+    if name == "zip":
+        return float(0.7 + 0.3 * stats.poisson.cdf(k, 5.0)) if k >= 0 else 0.0
+    if name == "yule_simon":
+        return float(stats.yulesimon.cdf(k, 2.0))
     raise ValueError(name)
 
 
@@ -273,7 +302,9 @@ def plot_experiment(out_dir, name=None, kernels=("poisson", "nb", "repoisson"), 
 
 def plot_grid(exp_root, names, kernels, logy, path):
     n = len(names)
-    fig, axes = plt.subplots(1, n, figsize=(4.4 * n, 3.5), sharex=False)
+    ncols = min(n, 4) if n else 1
+    nrows = int(np.ceil(n / ncols)) if n else 1
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.4 * ncols, 3.5 * nrows), sharex=False)
     axes = np.atleast_1d(axes).ravel()
     n_gen = 50000
     for ax, name in zip(axes, names):
@@ -289,6 +320,8 @@ def plot_grid(exp_root, names, kernels, logy, path):
             plot_discrete_ax(ax, name, gens, logy, n_gen)
         else:
             plot_gamma_ax(ax, gens, logy, n_gen, true_x)
+    for ax in axes[n:]:
+        ax.axis("off")
     axes[0].legend(loc="best", fontsize=7, frameon=False)
     fig.tight_layout()
     fig.savefig(path, dpi=180, bbox_inches="tight")
@@ -314,7 +347,10 @@ def parse_args():
     p.add_argument("--out_dir", default=None, help="one experiment folder; default = all")
     p.add_argument("--exp_root", default=str(ROOT / "experiments"))
     p.add_argument("--kernels", default=cfg.get("kernels", "poisson,nb,repoisson,twopois"))
-    p.add_argument("--names", default="gamma_ltj,nb,poismix_mod")
+    p.add_argument(
+        "--names",
+        default="gamma_ltj,nb,poismix_mod,pois20,poissmix,poissmix3,zip,yule_simon",
+    )
     return p.parse_args()
 
 

@@ -11,7 +11,8 @@ hidden: 128
 layers: 3
 continuous_t: true
 lbd: 100.0
-z_rescale: false
+scale: true                # net sees z/(λ α_t)=z/γ
+z_rescale: true
 clip_z: true
 clip_range: null
 normalize: null

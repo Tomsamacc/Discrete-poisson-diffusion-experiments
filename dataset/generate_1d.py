@@ -52,9 +52,35 @@ def poisson_mix(n, w=0.5, lam0=5.0, lam1=50.0, seed=None):
     return x
 
 
-def write_split(name, dist_train, dist_val, n_train=100000, n_val=50000):
+def poisson_mix_n(n, lams, weights, seed=None):
+    rng = np.random.default_rng(seed)
+    lams = np.asarray(lams, dtype=np.float64)
+    w = np.asarray(weights, dtype=np.float64)
+    w = w / w.sum()
+    if lams.size != w.size:
+        raise ValueError(f"lams {lams.size} vs weights {w.size}")
+    comp = rng.choice(lams.size, size=n, p=w)
+    x = np.empty(n, dtype=np.int64)
+    for i, lam in enumerate(lams):
+        m = comp == i
+        if m.any():
+            x[m] = rng.poisson(lam, size=int(m.sum()))
+    return x
+
+
+def zip_pois(n, pi0=0.7, lam=5.0, seed=None):
+    rng = np.random.default_rng(seed)
+    x = rng.poisson(lam, size=n).astype(np.int64)
+    x[rng.random(n) < pi0] = 0
+    return x
+
+
+def write_split(name, dist_train, dist_val, n_train=100000, n_val=50000, overwrite=False):
     train_path = os.path.join(DATA, name, "train.npy")
     val_path = os.path.join(DATA, name, "val.npy")
+    if (not overwrite) and os.path.isfile(train_path) and os.path.isfile(val_path):
+        print(f"skip {name} (exists)")
+        return
     xtr = generate_dataset(n_train, dist_train, train_path)
     xva = generate_dataset(n_val, dist_val, val_path)
     print(f"{name} train {xtr.shape} mean={xtr.mean():.4g} -> {train_path}")
@@ -76,4 +102,30 @@ if __name__ == "__main__":
         "poismix_mod",
         lambda n: poisson_mix(n, w=0.5, lam0=5.0, lam1=50.0, seed=0),
         lambda n: poisson_mix(n, w=0.5, lam0=5.0, lam1=50.0, seed=1),
+    )
+    write_split(
+        "pois20",
+        lambda n: stats.poisson.rvs(20, size=n, random_state=0),
+        lambda n: stats.poisson.rvs(20, size=n, random_state=1),
+    )
+    write_split(
+        "poissmix",
+        lambda n: poisson_mix(n, w=0.1, lam0=1.0, lam1=100.0, seed=0),
+        lambda n: poisson_mix(n, w=0.1, lam0=1.0, lam1=100.0, seed=1),
+    )
+    write_split(
+        "zip",
+        lambda n: zip_pois(n, pi0=0.7, lam=5.0, seed=0),
+        lambda n: zip_pois(n, pi0=0.7, lam=5.0, seed=1),
+    )
+    write_split(
+        "yule_simon",
+        lambda n: stats.yulesimon.rvs(2.0, size=n, random_state=0),
+        lambda n: stats.yulesimon.rvs(2.0, size=n, random_state=1),
+    )
+    # poissmix + middle peak: (1/3)Pois(1)+(1/3)Pois(50)+(1/3)Pois(100)
+    write_split(
+        "poissmix3",
+        lambda n: poisson_mix_n(n, (1.0, 50.0, 100.0), (1.0, 1.0, 1.0), seed=0),
+        lambda n: poisson_mix_n(n, (1.0, 50.0, 100.0), (1.0, 1.0, 1.0), seed=1),
     )

@@ -12,7 +12,8 @@ export PYTHONUNBUFFERED=1
 cd "$ROOT"
 mkdir -p experiments/h05
 
-DATASETS=(gamma_ltj nb poismix_mod)
+DATASETS=(gamma_ltj nb poismix_mod pois20 poissmix poissmix3 zip yule_simon)
+NAMES="gamma_ltj,nb,poismix_mod,pois20,poissmix,poissmix3,zip,yule_simon"
 
 for name in "${DATASETS[@]}"; do
   out="experiments/h05/${name}"
@@ -25,7 +26,8 @@ for name in "${DATASETS[@]}"; do
     "$PY" -u train.py -c config_h05.yml \
       --data "data/${name}" \
       --out_dir "$out" \
-      --lbd 100
+      --lbd 100 \
+      --scale true
   fi
 
   if [[ -f "${out}/samples_poisson.npy" && -f "${out}/samples_nb.npy" && -f "${out}/samples_repoisson.npy" && -f "${out}/samples_twopois.npy" ]]; then
@@ -44,5 +46,5 @@ for name in "${DATASETS[@]}"; do
 done
 
 echo "======== plot h05 ========"
-"$PY" -u test.py --exp_root experiments/h05 --kernels poisson,nb,repoisson,twopois
+"$PY" -u test.py --exp_root experiments/h05 --kernels poisson,nb,repoisson,twopois --names "$NAMES"
 echo "done"
