@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# 前台跑：
 #   conda activate itdpdm
 #   cd /home/zhaog30/LTJ_experiments
-#   ./train_h05.sh
+#   ./script/train_h05.sh
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${PY:-/home/zhaog30/miniconda3/envs/itdpdm/bin/python}"
 export PYTHONUNBUFFERED=1
 
@@ -30,7 +29,7 @@ for name in "${DATASETS[@]}"; do
       --scale true
   fi
 
-  if [[ -f "${out}/samples_poisson.npy" && -f "${out}/samples_nb.npy" && -f "${out}/samples_repoisson.npy" && -f "${out}/samples_twopois.npy" ]]; then
+  if [[ -f "${out}/samples_poisson.npy" && -f "${out}/samples_nb.npy" && -f "${out}/samples_twopois.npy" ]]; then
     echo "======== skip sample ${name} ========"
   else
     echo "======== sample ${name} 200 steps h=0.5 ========"
@@ -41,10 +40,10 @@ for name in "${DATASETS[@]}"; do
       --snr_min 0 \
       --snr_max 100 \
       --sample_steps 200 \
-      --kernels poisson,nb,repoisson,twopois
+      --kernels poisson,nb,twopois
   fi
 done
 
 echo "======== plot h05 ========"
-"$PY" -u test.py --exp_root experiments/h05 --kernels poisson,nb,repoisson,twopois --names "$NAMES"
+"$PY" -u test.py --exp_root experiments/h05 --kernels poisson,nb,twopois --names "$NAMES"
 echo "done"

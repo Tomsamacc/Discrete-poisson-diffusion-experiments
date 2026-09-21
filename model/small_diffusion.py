@@ -11,6 +11,7 @@ class PoissonDiscreteDiffusionModel(nn.Module):
         clip_z=True,
         clip_range=None,
         normalize=None,
+        ratio=False,
     ):
         super().__init__()
         self.net = net
@@ -19,6 +20,7 @@ class PoissonDiscreteDiffusionModel(nn.Module):
         self.clip_z = clip_z
         self.clip_range = clip_range
         self.normalize = normalize
+        self.ratio = bool(ratio)
 
     def prepare_z(self, z, alpha=None):
         """Copy of z for the MLP. Caller z is not modified."""
@@ -55,5 +57,7 @@ class PoissonDiscreteDiffusionModel(nn.Module):
 
     def forward(self, z, t, alpha=None):
         z_in = self.prepare_z(z, alpha=alpha)
-        xhat = self.net(z_in, t)
-        return self.clip_xhat(xhat)
+        out = self.net(z_in, t)
+        if self.ratio:
+            return out
+        return self.clip_xhat(out)

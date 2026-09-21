@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from loss.loss import posterior_moments_from_logB
 from model.small_diffusion import PoissonDiscreteDiffusionModel
 from train import ROOT, load_yaml, pair_or_none, resolve, str2bool
 
@@ -44,8 +45,8 @@ def parse_args():
     p.add_argument("--t_eps", type=float, default=float(pick("t_eps", 1e-4)))
     p.add_argument(
         "--kernels",
-        default=cfg.get("kernels", "poisson,nb,repoisson"),
-        help="comma list: poisson,nb,repoisson,twopois",
+        default=cfg.get("kernels", "poisson,nb,twopois"),
+        help="comma list: poisson,nb,twopois",
     )
     p.add_argument("--hidden", type=int, default=int(pick("hidden", 128)))
     p.add_argument("--layers", type=int, default=int(pick("layers", 3)))
@@ -61,6 +62,8 @@ def parse_args():
     p.add_argument("--clip_z", type=str2bool, default=pick("clip_z", True))
     p.add_argument("--clip_range", nargs=2, type=float, default=pair_or_none(pick("clip_range", None)))
     p.add_argument("--normalize", nargs=2, type=float, default=pair_or_none(pick("normalize", None)))
+    p.add_argument("--ratio", type=str2bool, default=bool(ckpt_args.get("ratio", cfg.get("ratio", False))))
+    p.add_argument("--k_max", type=int, default=int(ckpt_args.get("k_max", cfg.get("k_max", 3))))
     p.add_argument("--seed", type=int, default=int(pick("seed", 0)))
     args = p.parse_args()
     if args.ckpt is None:
@@ -71,13 +74,23 @@ def parse_args():
 
 
 def build_model(args, device):
-    net = MLP(
-        in_dim=1,
-        hidden=args.hidden,
-        out_dim=1,
-        layers=args.layers,
-        continuous_t=args.continuous_t,
-    )
+    if bool(getattr(args, "ratio", False)):
+        RatioMLP = importlib.import_module("model.ratio_mlp").RatioMLP
+        net = RatioMLP(
+            in_dim=1,
+            hidden=args.hidden,
+            out_dim=int(getattr(args, "k_max", 3)),
+            layers=args.layers,
+            continuous_t=args.continuous_t,
+        )
+    else:
+        net = MLP(
+            in_dim=1,
+            hidden=args.hidden,
+            out_dim=1,
+            layers=args.layers,
+            continuous_t=args.continuous_t,
+        )
     model = PoissonDiscreteDiffusionModel(
         net,
         lbd=args.lbd,
@@ -85,6 +98,7 @@ def build_model(args, device):
         clip_z=args.clip_z,
         clip_range=args.clip_range,
         normalize=args.normalize,
+        ratio=bool(getattr(args, "ratio", False)),
     ).to(device)
     ckpt = torch.load(args.ckpt, map_location=device, weights_only=False)
     model.load_state_dict(ckpt["model"])
@@ -101,13 +115,37 @@ def time_of(gamma, lbd, t_eps, n, device):
     return t
 
 
+def make_gammas(schedule, steps, g0, g1, device, power=None):
+    steps = int(steps)
+    if power is None:
+        power = 1.0 if schedule == "uniform" else 2.0
+    i = torch.arange(steps + 1, device=device, dtype=torch.float32)
+    g = float(g0) + (float(g1) - float(g0)) * (i / float(steps)).pow(float(power))
+    g[0] = float(g0)
+    g[-1] = float(g1)
+    return g
+
+
+def predict_log_B(model, z, gamma, args):
+    t = time_of(gamma, args.lbd, args.t_eps, z.shape[0], z.device)
+    alpha = t if args.z_rescale else None
+    return model(z, t, alpha=alpha)
+
+
 def predict_x(model, z, gamma, args):
+    if bool(getattr(args, "ratio", False)):
+        log_B = predict_log_B(model, z, gamma, args)
+        return posterior_moments_from_logB(log_B, z)[0]
     t = time_of(gamma, args.lbd, args.t_eps, z.shape[0], z.device)
     alpha = t if args.z_rescale else None
     return model(z, t, alpha=alpha)
 
 
 def posterior_moments(model, z, gamma, args, order=3):
+    if bool(getattr(args, "ratio", False)):
+        log_B = predict_log_B(model, z, gamma, args)
+        moms = posterior_moments_from_logB(log_B, z)
+        return moms[: int(order)]
     acc = None
     moms = []
     for i in range(order):
@@ -155,6 +193,17 @@ def nb_gap(m, v, h):
 
 @torch.no_grad()
 def reverse_step(model, z, gamma, h, kernel, args):
+    if bool(getattr(args, "ratio", False)):
+        moms = posterior_moments(model, z, gamma, args, order=3)
+        m1 = moms[0]
+        if kernel == "poisson":
+            return z + torch.poisson((h * m1).clamp_min(0.0))
+        if kernel == "nb":
+            v = (moms[1] - m1 * m1).clamp_min(0.0)
+            return z + nb_gap(m1, v, h)
+        if kernel in ("twopois", "2pois", "two_poisson"):
+            return z + two_pois_gap(moms[0], moms[1], moms[2], h)
+        raise ValueError(kernel)
     m = predict_x(model, z, gamma, args)
     if kernel == "poisson":
         return z + torch.poisson((h * m).clamp_min(0.0))
@@ -172,20 +221,23 @@ def reverse_step(model, z, gamma, h, kernel, args):
 
 
 @torch.no_grad()
-def generate(model, n, kernel, args, device):
-    g0, g1 = float(args.snr_min), float(args.snr_max)
-    steps = int(args.sample_steps)
-    h = (g1 - g0) / steps
+def generate(model, n, kernel, args, device, gammas=None):
+    if gammas is None:
+        g0, g1 = float(args.snr_min), float(args.snr_max)
+        steps = int(args.sample_steps)
+        gammas = make_gammas("uniform", steps, g0, g1, device)
     out = []
-    left = n
+    left = int(n)
+    hs = gammas[1:] - gammas[:-1]
+    g_last = float(gammas[-1].item())
     while left > 0:
         b = min(int(args.sample_batch), left)
         z = torch.zeros(b, 1, device=device)
-        gamma = g0
-        for _ in range(steps):
-            z = reverse_step(model, z, gamma, h, kernel, args)
-            gamma = gamma + h
-        x = (z / max(float(gamma), 1e-12)).clamp_min(0.0)
+        for i in range(hs.numel()):
+            g = float(gammas[i].item())
+            h = float(hs[i].item())
+            z = reverse_step(model, z, g, h, kernel, args)
+        x = (z / max(g_last, 1e-12)).clamp_min(0.0)
         if args.normalize is not None:
             x = model.decode_x(x)
         out.append(x.cpu())
@@ -221,7 +273,7 @@ def main():
     from test import plot_experiment
 
     plot_keys = tuple(
-        k for k in ("poisson", "nb", "repoisson", "twopois") if (out_dir / f"samples_{k}.npy").is_file()
+        k for k in ("poisson", "nb", "twopois") if (out_dir / f"samples_{k}.npy").is_file()
     )
     plot_experiment(out_dir, kernels=plot_keys)
 

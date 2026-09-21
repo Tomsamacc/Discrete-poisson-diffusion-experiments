@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 
-from loss.loss import BregmanLoss
+from loss.loss import BregmanLoss, NormalizedRatioLoss, normalized_ratio_targets
 from model.small_diffusion import PoissonDiscreteDiffusionModel
 
 ROOT = Path(__file__).resolve().parent
@@ -130,6 +130,18 @@ def parse_args():
         metavar=("MEAN", "STD"),
         help="affine on x0",
     )
+    g.add_argument(
+        "--ratio",
+        type=str2bool,
+        default=bool(cfg.get("ratio", False)),
+        help="train normalized PMF ratios b_k=log B_k instead of posterior mean",
+    )
+    g.add_argument(
+        "--k_max",
+        type=int,
+        default=int(cfg.get("k_max", 3)),
+        help="ratio heads k=1..k_max",
+    )
 
     g = p.add_argument_group("train")
     g.add_argument("--epochs", type=int, default=int(cfg.get("epochs", 200)), help="epochs")
@@ -207,10 +219,14 @@ def run_epoch(model, loader, loss_fn, args, device, opt=None):
         xb = xb.to(device)
         t = torch.rand(xb.shape[0], device=device) * (1.0 - args.t_eps) + args.t_eps
         z = q_sample(xb, t, args.lbd)
-        target = model.encode_x(xb)
         alpha = t if args.z_rescale else None
-        xhat = model(z, t, alpha=alpha)
-        loss = loss_fn(xhat, target)
+        pred = model(z, t, alpha=alpha)
+        if args.ratio:
+            target = normalized_ratio_targets(xb, z, args.k_max)
+            loss = loss_fn(pred, target)
+        else:
+            target = model.encode_x(xb)
+            loss = loss_fn(pred, target)
         if train:
             opt.zero_grad(set_to_none=True)
             loss.backward()
@@ -237,13 +253,23 @@ def main():
     if val_path.is_file():
         val_loader = make_loader(load_counts(val_path), args.batch_size, shuffle=False)
 
-    net = MLP(
-        in_dim=xtr.shape[-1],
-        hidden=args.hidden,
-        out_dim=xtr.shape[-1],
-        layers=args.layers,
-        continuous_t=args.continuous_t,
-    )
+    if args.ratio:
+        RatioMLP = importlib.import_module("model.ratio_mlp").RatioMLP
+        net = RatioMLP(
+            in_dim=xtr.shape[-1],
+            hidden=args.hidden,
+            out_dim=int(args.k_max),
+            layers=args.layers,
+            continuous_t=args.continuous_t,
+        )
+    else:
+        net = MLP(
+            in_dim=xtr.shape[-1],
+            hidden=args.hidden,
+            out_dim=xtr.shape[-1],
+            layers=args.layers,
+            continuous_t=args.continuous_t,
+        )
     model = PoissonDiscreteDiffusionModel(
         net,
         lbd=args.lbd,
@@ -251,6 +277,7 @@ def main():
         clip_z=args.clip_z,
         clip_range=args.clip_range,
         normalize=args.normalize,
+        ratio=bool(args.ratio),
     ).to(device)
     opt = torch.optim.Adam(
         model.parameters(),
@@ -258,14 +285,19 @@ def main():
         betas=(args.beta1, args.beta2),
         weight_decay=args.weight_decay,
     )
-    loss_fn = BregmanLoss(reduction="mean")
+    loss_fn = (
+        NormalizedRatioLoss(reduction="mean")
+        if args.ratio
+        else BregmanLoss(reduction="mean")
+    )
 
     with open(out_dir / "args.json", "w") as f:
         json.dump(vars(args), f, indent=2)
 
     print(
         f"train n={len(xtr)} val={'yes' if val_loader else 'no'} "
-        f"lbd={args.lbd} scale={args.z_rescale} lr={args.lr} bs={args.batch_size} "
+        f"lbd={args.lbd} scale={args.z_rescale} ratio={args.ratio} k_max={args.k_max} "
+        f"lr={args.lr} bs={args.batch_size} "
         f"epochs={args.epochs} val_every={args.val_every} "
         f"device={device} out={out_dir}",
         flush=True,

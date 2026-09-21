@@ -1,5 +1,5 @@
-# SNR 0→100, 200 steps, h=0.5
-# python train.py -c config_h05.yml --data data/nb --out_dir experiments/h05/nb
+# PMF-ratio k=1,2,3. λ=100, z_rescale, T=100.
+# python train.py -c config_pmfratio.yml --data data/nb --out_dir experiments/pmfratio/nb
 
 # data
 data: data/nb
@@ -11,11 +11,13 @@ hidden: 128
 layers: 3
 continuous_t: true
 lbd: 100.0
-scale: true                # net sees z/(λ α_t)=z/γ
+scale: true
 z_rescale: true
 clip_z: true
 clip_range: null
 normalize: null
+ratio: true
+k_max: 3
 
 # train
 epochs: 200
@@ -28,14 +30,14 @@ t_eps: 1.0e-4
 seed: 0
 
 # io
-out_dir: experiments/h05/nb
+out_dir: experiments/pmfratio/nb
 device: cuda
 val_every: 10
 
 # sample
 snr_min: 0.0
 snr_max: 100.0
-sample_steps: 200         # h = 100/200 = 0.5
+sample_steps: 100
 n_sample: 50000
 sample_batch: 4096
 kernels: poisson,nb,twopois

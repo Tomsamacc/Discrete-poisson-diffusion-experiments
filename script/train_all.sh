@@ -2,10 +2,10 @@
 # 前台跑，不要 nohup：
 #   conda activate itdpdm
 #   cd /home/zhaog30/LTJ_experiments
-#   ./train_all.sh
+#   ./script/train_all.sh
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${PY:-/home/zhaog30/miniconda3/envs/itdpdm/bin/python}"
 export PYTHONUNBUFFERED=1
 
@@ -28,10 +28,10 @@ for name in "${DATASETS[@]}"; do
       --lbd 100
   fi
 
-  if [[ -f "${out}/samples_poisson.npy" && -f "${out}/samples_nb.npy" && -f "${out}/samples_repoisson.npy" ]]; then
+  if [[ -f "${out}/samples_poisson.npy" && -f "${out}/samples_nb.npy" ]]; then
     echo "======== skip sample ${name} ========"
   else
-    echo "======== sample ${name} poisson/nb/repoisson ========"
+    echo "======== sample ${name} poisson/nb ========"
     "$PY" -u sample.py -c config.yml \
       --ckpt "${out}/best.pt" \
       --out_dir "$out" \
@@ -39,7 +39,7 @@ for name in "${DATASETS[@]}"; do
       --snr_min 0 \
       --snr_max 100 \
       --sample_steps 100 \
-      --kernels poisson,nb,repoisson
+      --kernels poisson,nb
   fi
 done
 

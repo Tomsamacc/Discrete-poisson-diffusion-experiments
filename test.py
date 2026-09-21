@@ -248,7 +248,7 @@ def metrics_discrete(name, gens, true_x, pmfs, overflow, true_p):
     return rows
 
 
-def plot_experiment(out_dir, name=None, kernels=("poisson", "nb", "repoisson"), data_root=None):
+def plot_experiment(out_dir, name=None, kernels=("poisson", "nb", "twopois"), data_root=None):
     out_dir = Path(out_dir)
     name = name or infer_name(out_dir)
     data_root = Path(data_root) if data_root else ROOT / "data" / name
@@ -346,7 +346,7 @@ def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("--out_dir", default=None, help="one experiment folder; default = all")
     p.add_argument("--exp_root", default=str(ROOT / "experiments"))
-    p.add_argument("--kernels", default=cfg.get("kernels", "poisson,nb,repoisson,twopois"))
+    p.add_argument("--kernels", default=cfg.get("kernels", "poisson,nb,twopois"))
     p.add_argument(
         "--names",
         default="gamma_ltj,nb,poismix_mod,pois20,poissmix,poissmix3,zip,yule_simon",

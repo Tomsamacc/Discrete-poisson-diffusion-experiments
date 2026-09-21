@@ -1,12 +1,11 @@
 #!/usr/bin/env bash
 # 100 steps, h=1, scale=True. 不覆盖 experiments/{gamma_ltj,nb,...} 那次没 scale 的结果。
-# 前台跑：
 #   conda activate itdpdm
 #   cd /home/zhaog30/LTJ_experiments
-#   ./train_scale.sh
+#   ./script/train_scale.sh
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="${PY:-/home/zhaog30/miniconda3/envs/itdpdm/bin/python}"
 export PYTHONUNBUFFERED=1
 
@@ -31,7 +30,7 @@ for name in "${DATASETS[@]}"; do
       --scale true
   fi
 
-  if [[ -f "${out}/samples_poisson.npy" && -f "${out}/samples_nb.npy" && -f "${out}/samples_repoisson.npy" && -f "${out}/samples_twopois.npy" ]]; then
+  if [[ -f "${out}/samples_poisson.npy" && -f "${out}/samples_nb.npy" && -f "${out}/samples_twopois.npy" ]]; then
     echo "======== skip sample ${name} ========"
   else
     echo "======== sample ${name} 100 steps h=1 ========"
@@ -42,10 +41,10 @@ for name in "${DATASETS[@]}"; do
       --snr_min 0 \
       --snr_max 100 \
       --sample_steps 100 \
-      --kernels poisson,nb,repoisson,twopois
+      --kernels poisson,nb,twopois
   fi
 done
 
 echo "======== plot scale (100 steps) ========"
-"$PY" -u test.py --exp_root experiments/scale --kernels poisson,nb,repoisson,twopois --names "$NAMES"
+"$PY" -u test.py --exp_root experiments/scale --kernels poisson,nb,twopois --names "$NAMES"
 echo "done"

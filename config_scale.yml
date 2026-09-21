@@ -38,4 +38,4 @@ snr_max: 100.0
 sample_steps: 100
 n_sample: 50000
 sample_batch: 4096
-kernels: poisson,nb,repoisson,twopois
+kernels: poisson,nb,twopois
