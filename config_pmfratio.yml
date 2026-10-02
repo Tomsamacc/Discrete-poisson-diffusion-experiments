@@ -18,6 +18,7 @@ clip_range: null
 normalize: null
 ratio: true
 k_max: 3
+ratio_loss: normalized
 
 # train
 epochs: 200

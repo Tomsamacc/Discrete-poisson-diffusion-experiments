@@ -5,16 +5,21 @@ __pycache__/
 .venv/
 venv/
 
-# data and checkpoints
-data/**/*.npy
+# data and checkpoints. Regenerate data with dataset/generate_1d.py
+data/
 *.pt
 *.pth
 *.ckpt
 
-# experiment outputs
+# trained runs and sampled outputs. test_exp/*.py and test_exp/script stay tracked.
 experiments/
 runs/
-test_exp/
+test_exp/results/
+test_exp/oracle/
+test_exp/quad/
+test_exp/unif/
+test_exp/sweep/
+test_exp/*.txt
 
 # samples / plots / logs
 *.npy

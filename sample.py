@@ -6,7 +6,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from loss.loss import posterior_moments_from_logB
+from loss.consistency import assemble_log_s
+from loss.loss import full_bregman, higher_moment_maps, linked_mean, moments_from_ratio_pred
+from loss.oracle import gamma_bin_index, oracle_moments
 from model.small_diffusion import PoissonDiscreteDiffusionModel
 from train import ROOT, load_yaml, pair_or_none, resolve, str2bool
 
@@ -64,12 +66,27 @@ def parse_args():
     p.add_argument("--normalize", nargs=2, type=float, default=pair_or_none(pick("normalize", None)))
     p.add_argument("--ratio", type=str2bool, default=bool(ckpt_args.get("ratio", cfg.get("ratio", False))))
     p.add_argument("--k_max", type=int, default=int(ckpt_args.get("k_max", cfg.get("k_max", 3))))
+    p.add_argument(
+        "--ratio_loss",
+        default=str(ckpt_args.get("ratio_loss", cfg.get("ratio_loss", "normalized"))),
+        choices=("normalized", "balanced", "raw"),
+    )
     p.add_argument("--seed", type=int, default=int(pick("seed", 0)))
     args = p.parse_args()
     if args.ckpt is None:
         p.error("--ckpt is required")
     if args.out_dir is None:
         args.out_dir = str(Path(args.ckpt).resolve().parent)
+    if str(getattr(args, "ratio_loss", "normalized")) in ("balanced", "raw"):
+        args.ratio = True
+    args.prior_moments = ckpt_args.get("prior_moments")
+    args.moment_param = str(ckpt_args.get("moment_param", "direct"))
+    args.moment_loss = str(ckpt_args.get("moment_loss", "moment"))
+    args.hm_param = str(ckpt_args.get("hm_param", "") or "")
+    args.hybrid_weight = str(ckpt_args.get("hybrid_weight", "equal") or "equal")
+    args.raw_weight = ckpt_args.get("raw_weight", "equal")
+    args.consistency = str(ckpt_args.get("consistency", "none") or "none")
+    args.lambda_cons = float(ckpt_args.get("lambda_cons", 1.0) or 1.0)
     return args
 
 
@@ -132,19 +149,67 @@ def predict_log_B(model, z, gamma, args):
     return model(z, t, alpha=alpha)
 
 
+def shifted_logs(model, z, gamma, args):
+    """Network output at z, z+1, z+2. Same gamma, so same t."""
+    return (
+        predict_log_B(model, z, gamma, args),
+        predict_log_B(model, z + 1.0, gamma, args),
+        predict_log_B(model, z + 2.0, gamma, args),
+    )
+
+
+def log_s_eval(model, z, gamma, args):
+    """Log S used for moments, residual of that S, and residual before projection."""
+    mode = str(getattr(args, "consistency", "none") or "none")
+    a, a1, a2 = shifted_logs(model, z, gamma, args)
+    return assemble_log_s(a, a1, a2, mode)
+
+
+def log_s_for_moments(model, z, gamma, args):
+    mode = str(getattr(args, "consistency", "none") or "none")
+    if mode not in ("hard", "project"):
+        return predict_log_B(model, z, gamma, args)
+    a, a1, a2 = shifted_logs(model, z, gamma, args)
+    log_s, _, _, _, _ = assemble_log_s(a, a1, a2, mode)
+    return log_s
+
+
 def predict_x(model, z, gamma, args):
+    kind = str(getattr(args, "moment_loss", ""))
+    if kind == "hm":
+        return posterior_moments(model, z, gamma, args, order=1)[0]
+    if kind in ("soft_ratio", "offset"):
+        pred = predict_log_B(model, z, gamma, args)
+        gmin = float(getattr(args, "t_eps", 1e-4)) * float(getattr(args, "lbd", 100.0))
+        return linked_mean(pred, z, gamma, kind, gmin=gmin).float().view(-1, 1)
     if bool(getattr(args, "ratio", False)):
-        log_B = predict_log_B(model, z, gamma, args)
-        return posterior_moments_from_logB(log_B, z)[0]
+        log_pred = predict_log_B(model, z, gamma, args)
+        return moments_from_ratio_pred(log_pred, z, gamma, args)[0]
     t = time_of(gamma, args.lbd, args.t_eps, z.shape[0], z.device)
     alpha = t if args.z_rescale else None
     return model(z, t, alpha=alpha)
 
 
 def posterior_moments(model, z, gamma, args, order=3):
+    kind = str(getattr(args, "moment_loss", ""))
+    if kind == "hm":
+        pred = predict_log_B(model, z, gamma, args)
+        gmin = float(getattr(args, "t_eps", 1e-4)) * float(getattr(args, "lbd", 100.0))
+        m, _s = higher_moment_maps(
+            pred,
+            z,
+            gamma,
+            str(getattr(args, "hm_param", "raw_log")),
+            gmin=gmin,
+            prior=getattr(args, "prior_moments", None),
+        )
+        return [m[:, k].float().view(-1, 1) for k in range(int(order))]
+    if kind in ("soft_ratio", "offset"):
+        m1 = predict_x(model, z, gamma, args)
+        return [m1 for _ in range(int(order))]
     if bool(getattr(args, "ratio", False)):
-        log_B = predict_log_B(model, z, gamma, args)
-        moms = posterior_moments_from_logB(log_B, z)
+        log_pred = log_s_for_moments(model, z, gamma, args)
+        moms = moments_from_ratio_pred(log_pred, z, gamma, args)
         return moms[: int(order)]
     acc = None
     moms = []
@@ -155,18 +220,47 @@ def posterior_moments(model, z, gamma, args, order=3):
     return moms
 
 
-def two_pois_gap(m1, m2, m3, h):
-    """3-moment two-point mix: K ~ w Pois(h x1) + (1-w) Pois(h x2)."""
+def step_from_moments(z, h, kernel, moms, stats=None):
+    m1 = moms[0]
+    if kernel == "poisson":
+        return z + torch.poisson((h * m1).clamp_min(0.0))
+    if kernel == "nb":
+        v = (moms[1] - m1 * m1).clamp_min(0.0)
+        return z + nb_gap(m1, v, h)
+    if kernel in ("twopois", "2pois", "two_poisson"):
+        return z + two_pois_gap(moms[0], moms[1], moms[2], h, stats=stats)
+    raise ValueError(kernel)
+
+
+def two_pois_gap(m1, m2, m3, h, stats=None):
+    """3-moment two-point mix: K ~ w Pois(h x1) + (1-w) Pois(h x2).
+
+    Fallback to Pois(h m1) when m1<=0, v is below tolerance, or x1<0.
+    w is clamped to [1e-4, 1-1e-4] before the atoms are built.
+    stats counts rows. extreme_w uses the unclamped weight and does not change K.
+    """
     v = (m2 - m1 * m1).clamp_min(0.0)
     c3 = m3 - 3.0 * m1 * m2 + 2.0 * m1.pow(3)
     m_safe = m1.clamp_min(1e-8)
     thin = (m1 <= 0) | (v <= 1e-8 * m_safe)
     sigma = v.sqrt()
     g = c3 / sigma.pow(3).clamp_min(1e-12)
-    w = 0.5 * (1.0 + g / (g.square() + 4.0).sqrt())
-    w = w.clamp(1e-4, 1.0 - 1e-4)
+    w_raw = 0.5 * (1.0 + g / (g.square() + 4.0).sqrt())
+    w = w_raw.clamp(1e-4, 1.0 - 1e-4)
     x1 = m1 - sigma * ((1.0 - w) / w).sqrt()
     x2 = m1 + sigma * (w / (1.0 - w)).sqrt()
+    if stats is not None:
+        n = int(m1.numel())
+        stats["n"] = int(stats.get("n", 0)) + n
+        stats["invalid_v"] = int(stats.get("invalid_v", 0)) + int(thin.sum().item())
+        bad_atom = (~thin) & (
+            (x1 < 0) | (x2 < 0) | ~torch.isfinite(x1) | ~torch.isfinite(x2) | ~torch.isfinite(w_raw)
+        )
+        stats["invalid_atom"] = int(stats.get("invalid_atom", 0)) + int(bad_atom.sum().item())
+        extreme = (~thin) & torch.isfinite(w_raw) & ((w_raw < 0.01) | (w_raw > 0.99))
+        stats["extreme_w"] = int(stats.get("extreme_w", 0)) + int(extreme.sum().item())
+        fallback = thin | (x1 < 0)
+        stats["fallback"] = int(stats.get("fallback", 0)) + int(fallback.sum().item())
     k_p = torch.poisson((h * m1).clamp_min(0.0))
     pick = torch.rand_like(m1)
     k_mix = torch.where(
@@ -176,6 +270,36 @@ def two_pois_gap(m1, m2, m3, h):
     )
     k_mix = torch.where(x1 < 0, k_p, k_mix)
     return torch.where(thin, k_p, k_mix)
+
+
+def two_pois_moment_flags(m1, m2, m3):
+    """Same masks as two_pois_gap, without drawing K."""
+    m1 = m1.reshape(-1)
+    m2 = m2.reshape(-1)
+    m3 = m3.reshape(-1)
+    v_raw = m2 - m1 * m1
+    v = v_raw.clamp_min(0.0)
+    c3 = m3 - 3.0 * m1 * m2 + 2.0 * m1.pow(3)
+    m_safe = m1.clamp_min(1e-8)
+    thin = (m1 <= 0) | (v <= 1e-8 * m_safe)
+    sigma = v.sqrt()
+    g = c3 / sigma.pow(3).clamp_min(1e-12)
+    w_raw = 0.5 * (1.0 + g / (g.square() + 4.0).sqrt())
+    w = w_raw.clamp(1e-4, 1.0 - 1e-4)
+    x1 = m1 - sigma * ((1.0 - w) / w).sqrt()
+    x2 = m1 + sigma * (w / (1.0 - w)).sqrt()
+    bad_atom = (~thin) & (
+        (x1 < 0) | (x2 < 0) | ~torch.isfinite(x1) | ~torch.isfinite(x2) | ~torch.isfinite(w_raw)
+    )
+    extreme = (~thin) & torch.isfinite(w_raw) & ((w_raw < 0.01) | (w_raw > 0.99))
+    fallback = thin | (x1 < 0)
+    return {
+        "v_le_0": v_raw <= 0,
+        "thin": thin,
+        "bad_atom": bad_atom,
+        "extreme": extreme,
+        "fallback": fallback,
+    }
 
 
 def nb_gap(m, v, h):
@@ -192,18 +316,15 @@ def nb_gap(m, v, h):
 
 
 @torch.no_grad()
-def reverse_step(model, z, gamma, h, kernel, args):
+def reverse_step(model, z, gamma, h, kernel, args, oracle=None, stats=None):
+    if oracle is not None:
+        xs, logp = oracle
+        k_need = 1 if kernel == "poisson" else (2 if kernel == "nb" else 3)
+        moms = oracle_moments(z, gamma, xs, logp, k_max=max(int(k_need), 3))
+        return step_from_moments(z, h, kernel, moms, stats=stats)
     if bool(getattr(args, "ratio", False)):
         moms = posterior_moments(model, z, gamma, args, order=3)
-        m1 = moms[0]
-        if kernel == "poisson":
-            return z + torch.poisson((h * m1).clamp_min(0.0))
-        if kernel == "nb":
-            v = (moms[1] - m1 * m1).clamp_min(0.0)
-            return z + nb_gap(m1, v, h)
-        if kernel in ("twopois", "2pois", "two_poisson"):
-            return z + two_pois_gap(moms[0], moms[1], moms[2], h)
-        raise ValueError(kernel)
+        return step_from_moments(z, h, kernel, moms, stats=stats)
     m = predict_x(model, z, gamma, args)
     if kernel == "poisson":
         return z + torch.poisson((h * m).clamp_min(0.0))
@@ -216,12 +337,37 @@ def reverse_step(model, z, gamma, h, kernel, args):
         return z + nb_gap(m, v, h)
     if kernel in ("twopois", "2pois", "two_poisson"):
         m1, m2, m3 = posterior_moments(model, z, gamma, args, order=3)
-        return z + two_pois_gap(m1, m2, m3, h)
+        return z + two_pois_gap(m1, m2, m3, h, stats=stats)
     raise ValueError(kernel)
 
 
+def _on_policy_chunk(moms, z, gamma, h, xs, logp):
+    """Errors at one reverse state. eta_k = h^k m_k / k!."""
+    g = torch.full((z.shape[0],), float(gamma), device=z.device, dtype=torch.float32)
+    stars = oracle_moments(z, g, xs, logp, k_max=3)
+    mh = [m.reshape(-1).double() for m in moms]
+    ms = [s.reshape(-1).double() for s in stars]
+    logs = []
+    for k in range(3):
+        logs.append(
+            (mh[k].clamp_min(1e-12).log() - ms[k].clamp_min(1e-12).log()).detach().cpu()
+        )
+    habs = (float(h) * (mh[0] - ms[0]).abs()).detach().cpu()
+    kl = (float(h) * full_bregman(ms[0], mh[0])).detach().cpu()
+    eta2 = ((float(h) ** 2) * (mh[1] - ms[1]).abs() / 2.0).detach().cpu()
+    eta3 = ((float(h) ** 3) * (mh[2] - ms[2]).abs() / 6.0).detach().cpu()
+    return {
+        "idx": gamma_bin_index(g).detach().cpu(),
+        "log": logs,
+        "habs": habs,
+        "kl": kl,
+        "eta2": eta2,
+        "eta3": eta3,
+    }
+
+
 @torch.no_grad()
-def generate(model, n, kernel, args, device, gammas=None):
+def generate(model, n, kernel, args, device, gammas=None, oracle=None, counters=None, on_policy=None):
     if gammas is None:
         g0, g1 = float(args.snr_min), float(args.snr_max)
         steps = int(args.sample_steps)
@@ -233,12 +379,39 @@ def generate(model, n, kernel, args, device, gammas=None):
     while left > 0:
         b = min(int(args.sample_batch), left)
         z = torch.zeros(b, 1, device=device)
+        bad = torch.zeros(b, dtype=torch.bool, device=device) if counters is not None else None
+        record = (
+            on_policy is not None
+            and oracle is None
+            and model is not None
+            and int(on_policy.get("seen", 0)) < int(on_policy["n"])
+        )
         for i in range(hs.numel()):
             g = float(gammas[i].item())
             h = float(hs[i].item())
-            z = reverse_step(model, z, g, h, kernel, args)
+            twostats = counters if kernel in ("twopois", "2pois", "two_poisson") else None
+            if record:
+                g_t = torch.full((b, 1), g, device=device)
+                moms = posterior_moments(model, z, g_t, args, order=3)
+                z_before = z
+                z = step_from_moments(z, h, kernel, moms, stats=twostats)
+                on_policy["chunks"].append(
+                    _on_policy_chunk(moms, z_before, g, h, on_policy["xs"], on_policy["logp"])
+                )
+            else:
+                z = reverse_step(
+                    model, z, g, h, kernel, args, oracle=oracle, stats=twostats,
+                )
+            if bad is not None:
+                z1 = z.reshape(-1)
+                bad = bad | (~torch.isfinite(z1)) | (z1 > 1e6)
+        if record:
+            on_policy["seen"] = int(on_policy.get("seen", 0)) + int(b)
+        if counters is not None:
+            counters["traj"] = int(counters.get("traj", 0)) + int(b)
+            counters["runaway_traj"] = int(counters.get("runaway_traj", 0)) + int(bad.sum().item())
         x = (z / max(g_last, 1e-12)).clamp_min(0.0)
-        if args.normalize is not None:
+        if args.normalize is not None and model is not None:
             x = model.decode_x(x)
         out.append(x.cpu())
         left -= b
