@@ -12,9 +12,18 @@ data/
 *.ckpt
 
 # trained runs and sampled outputs. test_exp/*.py and test_exp/script stay tracked.
+# numbered reports are under pdf_files/; the builder stays local.
 experiments/
+pdf_files/
 runs/
 test_exp/results/
+test_exp/write_nb_trunk_pdf.py
+test_exp/write_sweep1d_pdf.py
+test_exp/write_cifar_pdf.py
+test_exp/write_focus1d_pdf.py
+test_exp/write_focus_extra_pdf.py
+test_exp/write_1d_cifar_pdf.py
+test_exp/write_cifar_fid_pdf.py
 test_exp/oracle/
 test_exp/quad/
 test_exp/unif/
@@ -26,6 +35,8 @@ test_exp/*.txt
 *.png
 *.pdf
 *.log
+*.sbatch
+slurm-*.out
 
 # keep code-side json out of runs; generated dumps
 **/args.json
@@ -38,3 +49,6 @@ test_exp/*.txt
 .idea/
 .vscode/
 *.swp
+
+# report
+cursor_bug_fix.md

@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import importlib
 
+import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 _mlp = importlib.import_module("model.1d_mlp")
 ConditionalLayer = _mlp.ConditionalLayer
@@ -13,10 +15,11 @@ timestep_embedding = _mlp.timestep_embedding
 class RatioMLP(nn.Module):
     """(z, t) -> (b_1,...,b_K),  b_k = log B_k,  B_k = [p_γ(z+k)/p_γ(z)] / γ^k."""
 
-    def __init__(self, in_dim=1, hidden=128, out_dim=3, layers=3, continuous_t=True):
+    def __init__(self, in_dim=1, hidden=128, out_dim=3, layers=3, continuous_t=True, detach_higher=False):
         super().__init__()
         self.hidden = hidden
         self.continuous_t = continuous_t
+        self.detach_higher = bool(detach_higher)
         temb_dim = 4 * hidden
         self.time_mlp = nn.Sequential(
             nn.Linear(hidden, temb_dim),
@@ -36,4 +39,12 @@ class RatioMLP(nn.Module):
         h = self.in_fc(x)
         for layer in self.layers:
             h = layer(h, t_emb)
-        return self.out_fc(h)
+        if not self.detach_higher or self.out_fc[1].out_features < 2:
+            return self.out_fc(h)
+        act = self.out_fc[0](h)
+        lin = self.out_fc[1]
+        bias0 = None if lin.bias is None else lin.bias[:1]
+        biask = None if lin.bias is None else lin.bias[1:]
+        y0 = F.linear(act, lin.weight[:1], bias0)
+        yk = F.linear(act.detach(), lin.weight[1:], biask)
+        return torch.cat([y0, yk], dim=-1)

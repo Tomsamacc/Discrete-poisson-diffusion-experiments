@@ -17,8 +17,10 @@ from loss.loss import (
     NormalizedRatioLoss,
     RawRatioBregmanLoss,
     moment_from_param,
+    beta_div,
     full_bregman,
     higher_moment_maps,
+    kernel_nll,
     linked_mean,
     quad_reverse_h,
     raw_multi_bregman,
@@ -182,8 +184,8 @@ def parse_args():
     g.add_argument(
         "--moment_loss",
         default=str(cfg.get("moment_loss", "moment")),
-        choices=("moment", "raw_ratio", "raw_multi", "hybrid", "raw_bal", "soft_ratio", "offset", "hm"),
-        help="moment: Bregman on m̂; raw_ratio: single-head D(R,S); raw_bal: (z+1)/gamma * D(R,S); raw_multi: weighted sum of D(R_k,S_k)",
+        choices=("moment", "mse", "raw_ratio", "raw_multi", "hybrid", "raw_bal", "soft_ratio", "offset", "hm"),
+        help="moment: Bregman on m̂; mse: (X-m̂)^2; raw_ratio: single-head D(R,S); raw_bal: (z+1)/gamma * D(R,S); raw_multi: weighted sum of D(R_k,S_k)",
     )
     g.add_argument(
         "--raw_weight",
@@ -212,7 +214,7 @@ def parse_args():
     g.add_argument(
         "--hm_param",
         default=str(cfg.get("hm_param", "raw_log")),
-        choices=("raw_log", "direct_ratio", "log_moment", "root_moment", "direct_moment"),
+        choices=("raw_log", "direct_ratio", "log_moment", "root_moment", "direct_moment", "var_gap"),
         help="k=2,3 link. m1 stays softplus. Loss stays D(R_k, S_k).",
     )
     g.add_argument(
@@ -226,6 +228,76 @@ def parse_args():
         default=str(cfg.get("cons_weight", "equal")),
         choices=("equal", "dyn_norm"),
         help="equal: delta2^2+delta3^2; dyn_norm: w2*delta2^2+w3*delta3^2",
+    )
+    g.add_argument(
+        "--trace_trunk_epochs",
+        type=int,
+        default=int(cfg.get("trace_trunk_epochs", 0)),
+        help="hm only: record trunk grad norms and cosines for the first N epochs",
+    )
+    g.add_argument(
+        "--save_best_l1",
+        type=str2bool,
+        default=bool(cfg.get("save_best_l1", False)),
+        help="also write best_l1.pt from validation L1",
+    )
+    g.add_argument(
+        "--higher_target",
+        default=str(cfg.get("higher_target", "ratio_kl")),
+        choices=("ratio_kl", "ratio_mse", "moment_kl", "moment_mse", "mixed", "moment_beta"),
+        help="hm k=2,3 target. L1 stays D(X, m1)",
+    )
+    g.add_argument(
+        "--higher_scale",
+        type=float,
+        default=float(cfg.get("higher_scale", 1.0)),
+        help="multiplier on the weighted L2 and L3 terms",
+    )
+    g.add_argument(
+        "--higher_only",
+        type=str2bool,
+        default=bool(cfg.get("higher_only", False)),
+        help="hm loss is weighted L2+L3, without L1",
+    )
+    g.add_argument(
+        "--save_best_h",
+        type=str2bool,
+        default=bool(cfg.get("save_best_h", False)),
+        help="write best_h.pt from lowest validation higher-head loss",
+    )
+    g.add_argument(
+        "--save_epochs",
+        default=str(cfg.get("save_epochs", "") or ""),
+        help="comma-separated epochs to keep as epoch_N.pt",
+    )
+    g.add_argument("--moment_beta", type=float, default=float(cfg.get("moment_beta", 1.0)))
+    g.add_argument(
+        "--kernel_nll",
+        default=str(cfg.get("kernel_nll", "none")),
+        choices=("none", "nb", "twopois"),
+    )
+    g.add_argument("--kernel_lam", type=float, default=float(cfg.get("kernel_lam", 0.0)))
+    g.add_argument("--l2_scale", type=float, default=float(cfg.get("l2_scale", 1.0)))
+    g.add_argument("--l3_scale", type=float, default=float(cfg.get("l3_scale", 1.0)))
+    g.add_argument("--freeze_heads", default=str(cfg.get("freeze_heads", "") or ""))
+    g.add_argument("--init_ckpt", default=str(cfg.get("init_ckpt", "") or ""), help="load weights before training")
+    g.add_argument(
+        "--freeze_m1",
+        type=str2bool,
+        default=bool(cfg.get("freeze_m1", False)),
+        help="freeze trunk and the m1 row; train higher-head rows only",
+    )
+    g.add_argument(
+        "--detach_higher",
+        type=str2bool,
+        default=bool(cfg.get("detach_higher", False)),
+        help="L2 and L3 do not backprop into the trunk",
+    )
+    g.add_argument(
+        "--trunk_lr_mult",
+        type=float,
+        default=float(cfg.get("trunk_lr_mult", 1.0)),
+        help="trunk Adam lr = lr * this. Head lr stays lr",
     )
 
     g = p.add_argument_group("train")
@@ -333,11 +405,6 @@ def _raw_multi_terms(model, xb, args):
 
 
 def _hm_batch(model, xb, args):
-    """m1 = softplus(f1), L1 = D(X, m1).
-
-    k=2,3 are converted to S_k, then L_k = D(R_k, S_k).
-    equal: L1+L2+L3. dyn: L1 + (h/2) L2 + (h^2/6) L3.
-    """
     t = torch.rand(xb.shape[0], device=xb.device) * (1.0 - args.t_eps) + args.t_eps
     z = q_sample(xb, t, args.lbd)
     alpha = t if args.z_rescale else None
@@ -346,18 +413,72 @@ def _hm_batch(model, xb, args):
     _m, s = higher_moment_maps(pred, z, t * args.lbd, args.hm_param, gmin=gmin)
     x = xb.reshape(-1).double().clamp_min(0)
     l1 = full_bregman(x, _m[:, 0])
-    target = raw_ratio_targets(xb, z, t * args.lbd, 3)
-    l2 = full_bregman(target[:, 1], s[:, 1])
-    l3 = full_bregman(target[:, 2], s[:, 2])
+    n_head = int(_m.shape[1])
+    target_name = str(getattr(args, "higher_target", "ratio_kl"))
+    if target_name == "ratio_kl":
+        target = raw_ratio_targets(xb, z, t * args.lbd, n_head)
+        l2 = full_bregman(target[:, 1], s[:, 1])
+        l3 = full_bregman(target[:, 2], s[:, 2]) if n_head >= 3 else None
+    elif target_name == "ratio_mse":
+        target = raw_ratio_targets(xb, z, t * args.lbd, n_head)
+        l2 = (target[:, 1] - s[:, 1]).square()
+        l3 = (target[:, 2] - s[:, 2]).square() if n_head >= 3 else None
+    elif target_name == "moment_kl":
+        l2 = full_bregman(x.pow(2), _m[:, 1])
+        l3 = full_bregman(x.pow(3), _m[:, 2]) if n_head >= 3 else None
+    elif target_name == "moment_mse":
+        l2 = (x.pow(2) - _m[:, 1]).square()
+        l3 = (x.pow(3) - _m[:, 2]).square() if n_head >= 3 else None
+    elif target_name == "moment_beta":
+        beta = float(getattr(args, "moment_beta", 1.0))
+        l2 = beta_div(x.pow(2), _m[:, 1], beta)
+        l3 = beta_div(x.pow(3), _m[:, 2], beta) if n_head >= 3 else None
+    elif target_name == "mixed":
+        target = raw_ratio_targets(xb, z, t * args.lbd, n_head)
+        l2 = full_bregman(target[:, 1], s[:, 1])
+        l3 = full_bregman(x.pow(3), _m[:, 2]) if n_head >= 3 else None
+    else:
+        raise ValueError(target_name)
+    h = quad_reverse_h(t, args.lbd, int(getattr(args, "weight_steps", 100)))
     if str(getattr(args, "hybrid_weight", "equal")) == "dyn":
-        h = quad_reverse_h(t, args.lbd, int(getattr(args, "weight_steps", 100)))
         l2 = l2 * (h / 2.0)
-        l3 = l3 * (h.square() / 6.0)
+        if l3 is not None:
+            l3 = l3 * (h.square() / 6.0)
     elif str(getattr(args, "hybrid_weight", "equal")) != "equal":
         raise ValueError(args.hybrid_weight)
-    heads = [l1.mean(), l2.mean(), l3.mean()]
-    loss = (l1 + l2 + l3).mean()
-    return loss, pred, heads, {"data": float(l1.detach().mean()), "cons": None}
+    scale = float(getattr(args, "higher_scale", 1.0))
+    l2 = l2 * scale * float(getattr(args, "l2_scale", 1.0))
+    if l3 is not None:
+        l3 = l3 * scale * float(getattr(args, "l3_scale", 1.0))
+    high = l2 if l3 is None else l2 + l3
+    kind = str(getattr(args, "kernel_nll", "none") or "none")
+    kn = None
+    if kind != "none":
+        kk = torch.poisson((h.float() * x.float()).clamp_min(0)).double()
+        if kind == "nb":
+            kn = kernel_nll("nb", kk, h, _m[:, 0], _m[:, 1])
+        else:
+            if n_head < 3:
+                raise ValueError("twopois kernel nll needs 3 heads")
+            kn = kernel_nll("twopois", kk, h, _m[:, 0], _m[:, 1], _m[:, 2])
+    heads = [l1.mean(), l2.mean()] if l3 is None else [l1.mean(), l2.mean(), l3.mean()]
+    lam = float(getattr(args, "kernel_lam", 0.0))
+    if kn is not None and lam <= 0.0:
+        objective = kn
+    elif kn is not None:
+        objective = kn + lam * high
+        if not bool(getattr(args, "higher_only", False)):
+            objective = l1 + objective
+    elif bool(getattr(args, "higher_only", False)):
+        objective = high
+    else:
+        objective = l1 + high
+    loss = objective.mean()
+    return loss, pred, heads, {
+        "data": float(l1.detach().mean()),
+        "cons": None,
+        "h": float(objective.detach().mean()),
+    }
 
 
 def _hybrid_batch(model, xb, args):
@@ -446,6 +567,14 @@ def _batch_loss(model, xb, loss_fn, args):
     alpha = t if args.z_rescale else None
     pred = model(z, t, alpha=alpha)
     k = int(getattr(args, "moment_k", 0) or 0)
+    if k > 0 and kind == "mse":
+        gamma = t * args.lbd
+        m_hat = moment_from_param(pred, z, gamma, k, args.moment_param)
+        x = xb.reshape(-1).double().clamp_min(0)
+        m = m_hat.reshape(-1).double()
+        loss = (x - m).square().mean()
+        l1 = full_bregman(x, m.clamp_min(1e-12)).mean()
+        return loss, pred, None, {"data": float(l1.detach()), "cons": None}
     if k > 0 and kind == "raw_ratio":
         gamma = t * args.lbd
         target = raw_ratio_targets(xb, z, gamma, k)[:, k - 1]
@@ -587,14 +716,18 @@ def _grad_l2(model):
     return float(torch.sqrt(sq))
 
 
-def run_epoch(model, loader, loss_fn, args, device, opt=None, grad_norms=None, head_trace=None):
+def run_epoch(
+    model, loader, loss_fn, args, device, opt=None, grad_norms=None, head_trace=None, after_backward=None
+):
     train = opt is not None
     model.train(train)
     total = 0.0
     data_total = 0.0
     cons_total = 0.0
+    h_total = 0.0
     n = 0
     n_cons = 0
+    n_h = 0
     for (xb,) in loader:
         xb = xb.to(device)
         loss, _, heads, info = _batch_loss(model, xb, loss_fn, args)
@@ -603,6 +736,8 @@ def run_epoch(model, loader, loss_fn, args, device, opt=None, grad_norms=None, h
             if heads is not None and head_trace is not None:
                 _record_trunk(model, heads, head_trace)
             loss.backward()
+            if after_backward is not None:
+                after_backward()
             if grad_norms is not None:
                 grad_norms.append(_grad_l2(model))
             opt.step()
@@ -612,9 +747,13 @@ def run_epoch(model, loader, loss_fn, args, device, opt=None, grad_norms=None, h
         if info["cons"] is not None:
             cons_total += float(info["cons"]) * bs
             n_cons += bs
+        if info.get("h") is not None:
+            h_total += float(info["h"]) * bs
+            n_h += bs
         n += bs
     cons_mean = cons_total / n_cons if n_cons else None
-    return total / max(n, 1), data_total / max(n, 1), cons_mean
+    h_mean = h_total / n_h if n_h else None
+    return total / max(n, 1), data_total / max(n, 1), cons_mean, h_mean
 
 
 @torch.no_grad()
@@ -941,6 +1080,66 @@ def apply_consistency(args):
     raise SystemExit(f"unknown consistency mode {mode}")
 
 
+def load_init(model, path):
+    blob = torch.load(path, map_location="cpu", weights_only=False)
+    src = blob["model"]
+    owned = {k: v.detach().clone() for k, v in model.state_dict().items()}
+    with torch.no_grad():
+        for key, value in src.items():
+            if key not in owned:
+                raise KeyError(key)
+            slot = owned[key]
+            if tuple(slot.shape) == tuple(value.shape):
+                slot.copy_(value)
+            elif key.endswith("out_fc.1.weight") and int(value.shape[0]) < int(slot.shape[0]) and tuple(value.shape[1:]) == tuple(slot.shape[1:]):
+                slot[: int(value.shape[0])].copy_(value)
+            elif key.endswith("out_fc.1.bias") and value.ndim == 1 and int(value.shape[0]) < int(slot.shape[0]):
+                slot[: int(value.shape[0])].copy_(value)
+            else:
+                raise RuntimeError(f"cannot copy {key} {tuple(value.shape)} -> {tuple(slot.shape)}")
+    model.load_state_dict(owned)
+
+
+def freeze_trunk_heads(model, heads):
+    last = model.net.out_fc[-1]
+    for p in model.parameters():
+        p.requires_grad_(p is last.weight or p is last.bias)
+    idx = [int(i) for i in heads]
+
+    def zero_heads():
+        if last.weight.grad is not None:
+            for i in idx:
+                last.weight.grad[i].zero_()
+        if last.bias is not None and last.bias.grad is not None:
+            for i in idx:
+                last.bias.grad[i].zero_()
+
+    return zero_heads
+
+
+def freeze_trunk_m1(model):
+    return freeze_trunk_heads(model, [0])
+
+
+def make_optimizer(model, args):
+    betas = (args.beta1, args.beta2)
+    wd = args.weight_decay
+    last = model.net.out_fc[-1]
+    if float(getattr(args, "trunk_lr_mult", 1.0)) != 1.0 and not bool(getattr(args, "freeze_m1", False)):
+        trunk = [p for p in model.parameters() if p is not last.weight and p is not last.bias and p.requires_grad]
+        heads = [p for p in (last.weight, last.bias) if p is not None and p.requires_grad]
+        return torch.optim.Adam(
+            [
+                {"params": trunk, "lr": float(args.lr) * float(args.trunk_lr_mult)},
+                {"params": heads, "lr": float(args.lr)},
+            ],
+            betas=betas,
+            weight_decay=wd,
+        )
+    params = [p for p in model.parameters() if p.requires_grad]
+    return torch.optim.Adam(params, lr=args.lr, betas=betas, weight_decay=wd)
+
+
 def main():
     args = parse_args()
     apply_consistency(args)
@@ -973,7 +1172,7 @@ def main():
             args.hybrid_weight = hw
     elif moment_loss == "hm":
         hp = str(getattr(args, "hm_param", "") or "")
-        if hp not in ("raw_log", "direct_ratio", "log_moment", "root_moment", "direct_moment"):
+        if hp not in ("raw_log", "direct_ratio", "log_moment", "root_moment", "direct_moment", "var_gap"):
             raise SystemExit(f"unknown hm_param {hp}")
         args.hm_param = hp
         hw = str(getattr(args, "hybrid_weight", "equal") or "equal")
@@ -981,7 +1180,8 @@ def main():
             raise SystemExit(f"unknown hybrid_weight {hw}")
         args.hybrid_weight = hw
         args.ratio = True
-        args.k_max = 3
+        if int(args.k_max) not in (2, 3):
+            args.k_max = 3
         args.moment_param = "direct"
         args.moment_k = 0
         moment_k = 0
@@ -1023,6 +1223,7 @@ def main():
             out_dim=int(args.k_max),
             layers=args.layers,
             continuous_t=args.continuous_t,
+            detach_higher=bool(getattr(args, "detach_higher", False)),
         )
     else:
         net = MLP(
@@ -1041,13 +1242,19 @@ def main():
         normalize=args.normalize,
         ratio=bool(args.ratio),
     ).to(device)
-    opt = torch.optim.Adam(
-        model.parameters(),
-        lr=args.lr,
-        betas=(args.beta1, args.beta2),
-        weight_decay=args.weight_decay,
-    )
-    if moment_loss in ("raw_multi", "hybrid", "raw_bal", "soft_ratio", "offset", "hm"):
+    init_ckpt = str(getattr(args, "init_ckpt", "") or "")
+    if init_ckpt:
+        load_init(model, resolve(init_ckpt))
+    held = []
+    if bool(getattr(args, "freeze_m1", False)):
+        held.append(0)
+    raw_heads = str(getattr(args, "freeze_heads", "") or "")
+    if raw_heads:
+        held.extend(int(part) for part in raw_heads.split(",") if part.strip() != "")
+    held = sorted(set(held))
+    zero_m1 = freeze_trunk_heads(model, held) if held else None
+    opt = make_optimizer(model, args)
+    if moment_loss in ("mse", "raw_multi", "hybrid", "raw_bal", "soft_ratio", "offset", "hm"):
         loss_fn = None
     elif moment_k > 0 and moment_loss == "raw_ratio":
         loss_fn = RawRatioBregmanLoss()
@@ -1079,6 +1286,11 @@ def main():
         f"moment_loss={moment_loss} hm_param={getattr(args, 'hm_param', '')} "
         f"raw_weight={getattr(args, 'raw_weight', 'equal')} "
         f"hybrid_weight={getattr(args, 'hybrid_weight', 'equal')} "
+        f"higher_target={getattr(args, 'higher_target', 'ratio_kl')} "
+        f"higher_scale={float(getattr(args, 'higher_scale', 1.0)):g} "
+        f"freeze_m1={bool(getattr(args, 'freeze_m1', False))} "
+        f"detach_higher={bool(getattr(args, 'detach_higher', False))} "
+        f"trunk_lr_mult={float(getattr(args, 'trunk_lr_mult', 1.0)):g} "
         f"consistency={getattr(args, 'consistency', 'none')} "
         f"lambda_cons={getattr(args, 'lambda_cons', 1.0):g} "
         f"cons_weight={getattr(args, 'cons_weight', 'equal')} "
@@ -1096,28 +1308,46 @@ def main():
         print(f"oracle moments skipped: {exc}", flush=True)
 
     best = float("inf")
+    best_l1 = float("inf")
+    best_h = float("inf")
+    save_epochs = {
+        int(x) for x in str(getattr(args, "save_epochs", "") or "").split(",") if str(x).strip()
+    }
     last_val = None
     last_mom = None
     grad_norms = []
-    head_trace = {"norms": [], "cos": []} if moment_loss in ("raw_multi", "hybrid") else None
+    trace_n = int(getattr(args, "trace_trunk_epochs", 0) or 0)
+    trace_hm = moment_loss == "hm" and trace_n > 0
+    head_trace = (
+        {"norms": [], "cos": []}
+        if moment_loss in ("raw_multi", "hybrid") or trace_hm
+        else None
+    )
+    history = []
     cons_grad_hist = []
     for epoch in range(1, args.epochs + 1):
         n0 = len(grad_norms)
         h0 = 0 if head_trace is None else len(head_trace["norms"])
-        train_loss, train_data, train_cons = run_epoch(
+        this_trace = head_trace
+        if trace_hm and epoch > trace_n:
+            this_trace = None
+        train_loss, train_data, train_cons, _train_h = run_epoch(
             model, train_loader, loss_fn, args, device, opt=opt,
             grad_norms=grad_norms if moment_k > 0 else None,
-            head_trace=head_trace,
+            head_trace=this_trace,
+            after_backward=zero_m1,
         )
         tick = epoch % args.val_every == 0 or epoch == args.epochs
         if not tick:
             continue
         val_loss = None
+        val_l1 = None
+        val_h = None
         mom_line = ""
         grad_line = ""
         if val_loader is not None:
             with torch.no_grad():
-                val_loss, _val_data, _val_cons = run_epoch(
+                val_loss, val_l1, _val_cons, val_h = run_epoch(
                     model, val_loader, loss_fn, args, device, opt=None
                 )
                 if xs is not None and moment_loss in ("raw_multi", "hybrid"):
@@ -1199,10 +1429,29 @@ def main():
             loss_bits = f" data {train_data:.4f}"
             if train_cons is not None:
                 loss_bits += f" cons {train_cons:.4f}"
+            val_l1_bit = ""
+            if val_l1 is not None and (moment_loss == "hm" or bool(getattr(args, "save_best_l1", False))):
+                val_l1_bit = f" valL1 {val_l1:.4f}"
+            if val_h is not None:
+                val_l1_bit += f" valH {val_h:.4f}"
             print(
-                f"epoch {epoch} train {train_loss:.4f}{loss_bits} val {val_loss:.4f}{mom_line}{grad_line}{r_line}",
+                f"epoch {epoch} train {train_loss:.4f}{loss_bits} val {val_loss:.4f}{val_l1_bit}{mom_line}{grad_line}{r_line}",
                 flush=True,
             )
+            if bool(getattr(args, "save_best_l1", False)) or (
+                moment_loss == "hm" and trace_hm
+            ):
+                history.append(
+                    {
+                        "epoch": epoch,
+                        "train": train_loss,
+                        "train_l1": train_data,
+                        "val": val_loss,
+                        "val_l1": val_l1,
+                        "val_h": val_h,
+                    }
+                )
+                (out_dir / "history.json").write_text(json.dumps(history, indent=2) + "\n")
         else:
             print(f"epoch {epoch} train {train_loss:.4f}", flush=True)
         ckpt = {
@@ -1211,6 +1460,7 @@ def main():
             "opt": opt.state_dict(),
             "train_loss": train_loss,
             "val_loss": val_loss if val_loss is not None else last_val,
+            "val_l1": val_l1,
             "best_val": best,
             "mom_val": last_mom,
             "args": vars(args),
@@ -1223,6 +1473,26 @@ def main():
             torch.save(ckpt, out_dir / "best.pt")
             if last_mom is not None:
                 (out_dir / "mom_best.json").write_text(json.dumps(last_mom, indent=2) + "\n")
+        if (
+            bool(getattr(args, "save_best_l1", False))
+            and val_l1 is not None
+            and val_l1 < best_l1
+        ):
+            best_l1 = val_l1
+            l1_ckpt = dict(ckpt)
+            l1_ckpt["best_l1"] = best_l1
+            torch.save(l1_ckpt, out_dir / "best_l1.pt")
+        if (
+            bool(getattr(args, "save_best_h", False))
+            and val_h is not None
+            and val_h < best_h
+        ):
+            best_h = val_h
+            h_ckpt = dict(ckpt)
+            h_ckpt["best_h"] = best_h
+            torch.save(h_ckpt, out_dir / "best_h.pt")
+        if epoch in save_epochs:
+            torch.save(ckpt, out_dir / f"epoch_{epoch}.pt")
     if moment_k > 0 and grad_norms:
         np.save(out_dir / "grad_norms.npy", np.asarray(grad_norms, dtype=np.float64))
         (out_dir / "grad_summary.json").write_text(
@@ -1239,6 +1509,7 @@ def main():
         (out_dir / "grad_cosine.json").write_text(json.dumps(cos_rows, indent=2) + "\n")
         _write_table(out_dir / "grads.txt", head_rows)
         _write_table(out_dir / "grad_cosine.txt", cos_rows)
+    (out_dir / "finished.json").write_text(json.dumps({"epochs": int(args.epochs)}) + "\n")
 
 
 if __name__ == "__main__":

@@ -323,7 +323,8 @@ def reverse_step(model, z, gamma, h, kernel, args, oracle=None, stats=None):
         moms = oracle_moments(z, gamma, xs, logp, k_max=max(int(k_need), 3))
         return step_from_moments(z, h, kernel, moms, stats=stats)
     if bool(getattr(args, "ratio", False)):
-        moms = posterior_moments(model, z, gamma, args, order=3)
+        need = 1 if kernel == "poisson" else (2 if kernel == "nb" else 3)
+        moms = posterior_moments(model, z, gamma, args, order=need)
         return step_from_moments(z, h, kernel, moms, stats=stats)
     m = predict_x(model, z, gamma, args)
     if kernel == "poisson":

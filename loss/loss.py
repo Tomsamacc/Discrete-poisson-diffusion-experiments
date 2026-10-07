@@ -125,6 +125,78 @@ def full_bregman(y, mu):
     return ylogy - torch.special.xlogy(y, mu) - y + mu
 
 
+def beta_div(y, mu, beta):
+    y = y.reshape(-1).double().clamp_min(0)
+    mu = mu.reshape(-1).double().clamp_min(1e-12)
+    b = float(beta)
+    if abs(b - 1.0) < 1e-8:
+        return full_bregman(y, mu)
+    return (
+        y.pow(b) / (b * (b - 1.0))
+        + mu.pow(b) / b
+        - y * mu.pow(b - 1.0) / (b - 1.0)
+    )
+
+
+def _log_pois_count(k, rate):
+    rate = rate.reshape(-1).double().clamp_min(0)
+    kk = k.reshape(-1).double()
+    logp = kk * rate.clamp_min(1e-12).log() - rate - torch.lgamma(kk + 1.0)
+    zero = torch.zeros_like(logp)
+    dead = torch.full_like(logp, -1e6)
+    return torch.where(rate <= 0, torch.where(kk == 0, zero, dead), logp)
+
+
+def kernel_nll(kind, k, h, m1, m2, m3=None):
+    m1 = m1.reshape(-1).double()
+    m2 = m2.reshape(-1).double()
+    hh = h.reshape(-1).double()
+    if hh.numel() == 1:
+        hh = hh.expand(m1.shape[0])
+    pois = _log_pois_count(k, hh * m1.clamp_min(0))
+    v_raw = m2 - m1 * m1
+    v = v_raw.clamp_min(0)
+    m_safe = m1.clamp_min(1e-8)
+    thin = (m1 <= 0) | (v <= 1e-8 * m_safe)
+    if kind == "nb":
+        r = (m_safe.square() / v.clamp_min(1e-12)).clamp(1e-4, 1e6)
+        scale = (v / m_safe).clamp_min(1e-12)
+        hs = hh * scale
+        kk = k.reshape(-1).double()
+        log_nb = (
+            torch.lgamma(kk + r)
+            - torch.lgamma(r)
+            - torch.lgamma(kk + 1.0)
+            + kk * hs.clamp_min(1e-12).log()
+            - (kk + r) * torch.log1p(hs)
+        )
+        return -torch.where(thin, pois, log_nb)
+    if kind != "twopois":
+        raise ValueError(kind)
+    if m3 is None:
+        raise ValueError("twopois kernel nll needs m3")
+    m3 = m3.reshape(-1).double()
+    c3 = m3 - 3.0 * m1 * m2 + 2.0 * m1.pow(3)
+    sigma = v.sqrt()
+    g = c3 / sigma.pow(3).clamp_min(1e-12)
+    w_raw = 0.5 * (1.0 + g / (g.square() + 4.0).sqrt())
+    w = w_raw.clamp(1e-4, 1.0 - 1e-4)
+    x1 = m1 - sigma * ((1.0 - w) / w).sqrt()
+    x2 = m1 + sigma * (w / (1.0 - w)).sqrt()
+    fallback = thin | (x1 < 0) | ~torch.isfinite(x1) | ~torch.isfinite(x2)
+    log_mix = torch.logsumexp(
+        torch.stack(
+            [
+                w.clamp_min(1e-12).log() + _log_pois_count(k, hh * x1.clamp_min(0)),
+                (1.0 - w).clamp_min(1e-12).log() + _log_pois_count(k, hh * x2.clamp_min(0)),
+            ],
+            dim=0,
+        ),
+        dim=0,
+    )
+    return -torch.where(fallback, pois, log_mix)
+
+
 def reduced_bregman(y, mu):
     """μ - y log μ. Same μ-gradient as full_bregman. The gap is y log y - y."""
     y = y.reshape(-1).double().clamp_min(0)
@@ -205,7 +277,7 @@ def raw_multi_weights(t, mode, lbd, steps, k_max=3):
     return w
 
 
-HIGHER_PARAMS = ("raw_log", "direct_ratio", "log_moment", "root_moment", "direct_moment")
+HIGHER_PARAMS = ("raw_log", "direct_ratio", "log_moment", "root_moment", "direct_moment", "var_gap")
 
 
 def higher_moment_maps(pred, z, gamma, param, gmin=1e-2, prior=None):
@@ -233,12 +305,13 @@ def higher_moment_maps(pred, z, gamma, param, gmin=1e-2, prior=None):
     tiny = g < float(gmin) * (1.0 - 1e-3)
     g_use = torch.where(g < float(gmin), torch.full_like(g, float(gmin)), g)
     log_g = g_use.log()
-    m = torch.empty(pred.shape[0], 3, dtype=torch.float64, device=pred.device)
+    n_head = int(pred.shape[1])
+    m = torch.empty(pred.shape[0], n_head, dtype=torch.float64, device=pred.device)
     s = torch.empty_like(m)
     m[:, 0] = torch.nn.functional.softplus(pred[:, 0])
     s[:, 0] = m[:, 0]
     log_D = torch.zeros_like(z)
-    for k in range(1, 4):
+    for k in range(1, n_head + 1):
         log_D = log_D + (z + float(k)).clamp_min(1e-12).log()
         if k == 1:
             continue
@@ -257,6 +330,15 @@ def higher_moment_maps(pred, z, gamma, param, gmin=1e-2, prior=None):
             sp = torch.nn.functional.softplus(a).clamp_min(1e-12)
             mk = sp.pow(float(k))
             sk = (float(k) * sp.log() - log_c).exp()
+        elif param == "var_gap":
+            m1 = m[:, 0]
+            if k == 2:
+                mk = m1.square() + torch.nn.functional.softplus(a)
+            else:
+                m2 = m[:, 1]
+                lower = m2.square() / m1.clamp_min(1e-8)
+                mk = lower + torch.nn.functional.softplus(a)
+            sk = (mk.clamp_min(1e-12).log() - log_c).exp()
         else:
             mk = torch.nn.functional.softplus(a)
             sk = (mk.clamp_min(1e-12).log() - log_c).exp()
